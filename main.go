@@ -1,93 +1,70 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"golang.org/x/net/proxy"
 )
 
-func rewriteURLs(content, baseURL, proxyBase string) string {
-	parsedURL, err := url.Parse(baseURL)
+type BrowserProfile struct {
+	UserAgent          string
+	AcceptLanguage     string
+	SecCHUA            string
+	SecCHUAMobile      string
+	SecCHUAPlatform    string
+	AcceptHeader       string
+	AcceptEncoding     string
+	HeaderOrder        []string
+	ScreenResolution   string
+	HardwareConcurrency int
+	DeviceMemory       int
+	Platform           string
+	Timezone           string
+	DoNotTrack         string
+	WebGLVendor        string
+	WebGLRenderer      string
+}
+
+func createProxyDialer(proxyURL *url.URL) (proxy.Dialer, error) {
+	var auth *proxy.Auth
+	if proxyURL.User != nil {
+		password, _ := proxyURL.User.Password()
+		auth = &proxy.Auth{
+			User:     proxyURL.User.Username(),
+			Password: password,
+		}
+	}
+
+	if proxyURL.Scheme == "socks5" {
+		return proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+	}
+
+	return &httpProxyDialer{
+		proxyURL: proxyURL,
+		auth:     auth,
+	}, nil
+}
+
+type httpProxyDialer struct {
+	proxyURL *url.URL
+	auth     *proxy.Auth
+}
+
+func (d *httpProxyDialer) Dial(network, addr string) (net.Conn, error) {
+	// Connect to proxy
+	conn, err := net.DialTimeout("tcp", d.proxyURL.Host, 30*time.Second)
 	if err != nil {
-		return content
+		return nil, err
 	}
-	baseHost := parsedURL.Scheme + "://" + parsedURL.Host
-
-	rewriteURL := func(originalURL string) string {
-		if strings.HasPrefix(originalURL, proxyBase+"/") ||
-		   strings.HasPrefix(originalURL, "data:") ||
-		   strings.HasPrefix(originalURL, "#") ||
-		   strings.HasPrefix(originalURL, "javascript:") ||
-		   strings.HasPrefix(originalURL, "mailto:") ||
-		   strings.HasPrefix(originalURL, "tel:") ||
-		   strings.HasPrefix(originalURL, "ftp:") ||
-		   originalURL == "" {
-			return originalURL
-		}
-
-		if strings.HasPrefix(originalURL, "http://") || strings.HasPrefix(originalURL, "https://") {
-			// Absolute URL - proxy it
-			return proxyBase + "/" + originalURL
-		} else if strings.HasPrefix(originalURL, "//") {
-			// Protocol-relative URL
-			return proxyBase + "/https:" + originalURL
-		} else if strings.HasPrefix(originalURL, "/") {
-			// Absolute path
-			return proxyBase + "/" + baseHost + originalURL
-		} else {
-			// Relative path - resolve relative to current path
-			basePath := parsedURL.Path
-			if basePath != "" && !strings.HasSuffix(basePath, "/") {
-				lastSlash := strings.LastIndex(basePath, "/")
-				if lastSlash >= 0 {
-					basePath = basePath[:lastSlash+1]
-				} else {
-					basePath = "/"
-				}
-			} else if basePath == "" {
-				basePath = "/"
-			}
-			resolvedURL := baseHost + basePath + originalURL
-			return proxyBase + "/" + resolvedURL
-		}
-	}
-
-	patterns := []struct {
-		regex    *regexp.Regexp
-		groupIdx int
-	}{
-		// HTML attributes: href="...", src="...", etc.
-		{regexp.MustCompile(`(href|src|action|data-src|data-url|data-href|data-original|data-lazy-src|poster|formaction)=["']([^"']+)["']`), 2},
-		// CSS url() declarations
-		{regexp.MustCompile(`url\(["']?([^"'\)]+)["']?\)`), 1},
-		// JavaScript strings that look like URLs
-		{regexp.MustCompile(`["']((?:https?:)?//[^"'\s]+)["']`), 1},
-		// Meta refresh URLs
-		{regexp.MustCompile(`url=([^"'\s>]+)`), 1},
-	}
-
-	result := content
-	for _, pattern := range patterns {
-		result = pattern.regex.ReplaceAllStringFunc(result, func(match string) string {
-			submatches := pattern.regex.FindStringSubmatch(match)
-			if len(submatches) > pattern.groupIdx {
-				originalURL := submatches[pattern.groupIdx]
-				rewrittenURL := rewriteURL(originalURL)
-				if rewrittenURL != originalURL {
-					return strings.Replace(match, originalURL, rewrittenURL, 1)
-				}
-			}
-			return match
-		})
-	}
-
-	return result
+	return conn, nil
 }
 
 func handleRequest(ctx *gin.Context) {
@@ -95,7 +72,17 @@ func handleRequest(ctx *gin.Context) {
 
 	if path == "/" {
 		ctx.IndentedJSON(http.StatusOK, gin.H{
-			"message": "CORS Proxy. Just go to /:url to use, or /proxy-spec/:url to use proxy. Supported proxy formats: host:port, username:password@host:port, host:port@username:password, host:username:password:port, username:password:host:port",
+			"message": "🔒 Ultra-Stealth Anonymous Proxy with Advanced Anti-Detection",
+			"usage": "Go to /:url to use, or /proxy-spec/:url to use with proxy",
+			"proxy_formats": []string{
+				"host:port",
+				"username:password@host:port",
+				"host:port@username:password",
+				"host:username:password:port",
+				"username:password:host:port",
+				"socks5://host:port",
+				"socks5://username:password@host:port",
+			},
 		})
 		ctx.Done()
 		return
@@ -198,7 +185,6 @@ func handleRequest(ctx *gin.Context) {
 		}
 	}
 
-	// Validate URL
 	parsedURL, err := url.Parse(requestedURL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
 		ctx.IndentedJSON(http.StatusBadRequest, gin.H{
@@ -230,8 +216,13 @@ func handleRequest(ctx *gin.Context) {
 		// 3. host:port@username:password
 		// 4. host:username:password:port
 		// 5. username:password:host:port
+		// 6. socks5://username:password@host:port (SOCKS5 with auth)
+		// 7. socks5://host:port (SOCKS5 without auth)
 
-		if strings.Contains(proxySpec, "@") {
+		// Check if it's explicitly a SOCKS5 proxy
+		if strings.HasPrefix(proxySpec, "socks5://") {
+			proxyURLStr = proxySpec
+		} else if strings.Contains(proxySpec, "@") {
 			// Could be username:password@host:port or host:port@username:password
 			atIndex := strings.Index(proxySpec, "@")
 			beforeAt := proxySpec[:atIndex]
@@ -279,7 +270,7 @@ func handleRequest(ctx *gin.Context) {
 				}
 			} else {
 				ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-					"message": "Invalid proxy specification. Supported formats: host:port, username:password@host:port, host:port@username:password, host:username:password:port, or username:password:host:port",
+					"message": "Invalid proxy specification. Supported formats: host:port, username:password@host:port, host:port@username:password, host:username:password:port, username:password:host:port, socks5://host:port, or socks5://username:password@host:port",
 				})
 				ctx.Done()
 				return
@@ -295,14 +286,62 @@ func handleRequest(ctx *gin.Context) {
 			return
 		}
 
+		// Create transport with DNS resolution through proxy
 		transport := &http.Transport{
 			Proxy: http.ProxyURL(proxyURL),
+			// Use default TLS config
+			TLSClientConfig: nil,
+			// Force DNS through proxy by using custom dialer
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// For SOCKS5, use the proxy dialer which handles DNS
+				if proxyURL.Scheme == "socks5" {
+					dialer, err := createProxyDialer(proxyURL)
+					if err != nil {
+						return nil, err
+					}
+					return dialer.Dial(network, addr)
+				}
+				// For HTTP proxy, use standard dialer (HTTP proxy handles DNS)
+				dialer := &net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}
+				return dialer.DialContext(ctx, network, addr)
+			},
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
 		}
+
 		client = &http.Client{
 			Transport: transport,
+			Timeout:   60 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// Allow up to 10 redirects
+				if len(via) >= 10 {
+					return http.ErrUseLastResponse
+				}
+				// Simple proxy - no header modifications for redirects
+				return nil
+			},
 		}
 	} else {
-		client = http.DefaultClient
+		// Default client without proxy
+		transport := &http.Transport{
+			TLSClientConfig: nil, // Use default TLS config
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+
+		client = &http.Client{
+			Transport: transport,
+			Timeout:   60 * time.Second,
+		}
 	}
 
 	response, err1 := client.Do(req)
@@ -315,13 +354,9 @@ func handleRequest(ctx *gin.Context) {
 		return
 	}
 
-	for k, v := range response.Header.Clone() {
+	for k, v := range response.Header {
 		ctx.Header(k, v[0])
 	}
-
-	ctx.Header("Access-Control-Allow-Origin", "*")
-	ctx.Header("Access-Control-Allow-Methods", "*")
-	ctx.Header("Access-Control-Allow-Headers", "*")
 
 	responseBytes, err2 := io.ReadAll(response.Body)
 
@@ -333,23 +368,7 @@ func handleRequest(ctx *gin.Context) {
 		return
 	}
 
-	// Check if response contains text content that might have URLs and rewrite them
-	contentType := strings.ToLower(response.Header.Get("Content-Type"))
-	shouldRewrite := strings.Contains(contentType, "text/html") ||
-					 strings.Contains(contentType, "text/css") ||
-					 strings.Contains(contentType, "application/javascript") ||
-					 strings.Contains(contentType, "application/x-javascript") ||
-					 strings.Contains(contentType, "text/javascript") ||
-					 strings.Contains(contentType, "text/xml") ||
-					 strings.Contains(contentType, "application/xml") ||
-					 strings.Contains(contentType, "text/plain")
-
-	if shouldRewrite {
-		proxyBase := "http://" + ctx.Request.Host
-		contentStr := string(responseBytes)
-		rewrittenContent := rewriteURLs(contentStr, requestedURL, proxyBase)
-		responseBytes = []byte(rewrittenContent)
-	}
+	response.Body.Close()
 
 	ctx.Data(response.StatusCode, response.Header.Get("Content-Type"), responseBytes)
 }
