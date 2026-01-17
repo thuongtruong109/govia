@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -14,375 +17,412 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-type BrowserProfile struct {
-	UserAgent          string
-	AcceptLanguage     string
-	SecCHUA            string
-	SecCHUAMobile      string
-	SecCHUAPlatform    string
-	AcceptHeader       string
-	AcceptEncoding     string
-	HeaderOrder        []string
-	ScreenResolution   string
-	HardwareConcurrency int
-	DeviceMemory       int
-	Platform           string
-	Timezone           string
-	DoNotTrack         string
-	WebGLVendor        string
-	WebGLRenderer      string
+var (
+	hopByHop = map[string]struct{}{
+		"Connection":          {},
+		"Proxy-Connection":    {},
+		"Keep-Alive":          {},
+		"TE":                  {},
+		"Trailer":             {},
+		"Transfer-Encoding":   {},
+		"Upgrade":             {},
+		"Proxy-Authenticate":  {},
+		"Proxy-Authorization": {},
+	}
+
+	dropHeaders = map[string]struct{}{
+		"Forwarded":       {},
+		"X-Forwarded-For": {},
+		"X-Real-Ip":       {},
+		"Via":             {},
+		"X-Proxy-Id":      {},
+		"True-Client-Ip":  {},
+		"Cf-Connecting-Ip": {},
+		"Cookie":        {},
+		"Authorization": {},
+		"Referer":       {},
+		"Origin":        {},
+	}
+)
+
+// ====================== SSRF protection ======================
+
+func isPrivateIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+
+	privateCIDRs := []string{
+		"10.0.0.0/8",
+		"172.16.0.0/12",
+		"192.168.0.0/16",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"::1/128",
+		"fc00::/7",
+		"fe80::/10",
+	}
+	for _, cidr := range privateCIDRs {
+		_, block, _ := net.ParseCIDR(cidr)
+		if block != nil && block.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
-func createProxyDialer(proxyURL *url.URL) (proxy.Dialer, error) {
-	var auth *proxy.Auth
-	if proxyURL.User != nil {
-		password, _ := proxyURL.User.Password()
-		auth = &proxy.Auth{
-			User:     proxyURL.User.Username(),
-			Password: password,
+func blockSSRF(u *url.URL) error {
+	if u == nil {
+		return errors.New("nil url")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("blocked scheme: %s (only http/https allowed)", u.Scheme)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errors.New("empty host")
+	}
+
+	lh := strings.ToLower(host)
+	if lh == "localhost" || lh == "localhost.localdomain" {
+		return fmt.Errorf("blocked host: %s", host)
+	}
+
+	// If IP literal
+	if ip := net.ParseIP(host); ip != nil {
+		if isPrivateIP(ip) {
+			return fmt.Errorf("blocked private/local ip: %s", ip.String())
+		}
+		return nil
+	}
+
+	// Resolve DNS and block private/local
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("dns lookup failed: %w", err)
+	}
+	if len(ips) == 0 {
+		return fmt.Errorf("no ip for host: %s", host)
+	}
+	for _, ip := range ips {
+		if isPrivateIP(ip) {
+			return fmt.Errorf("blocked private/local resolved ip: %s", ip.String())
+		}
+	}
+	return nil
+}
+
+// ====================== Header sanitize ======================
+
+func copySafeRequestHeaders(dst, src http.Header) {
+	for k, vals := range src {
+		// Skip hop-by-hop headers
+		if _, ok := hopByHop[k]; ok {
+			continue
+		}
+		// Skip drop list headers
+		if _, ok := dropHeaders[k]; ok {
+			continue
+		}
+
+		for _, v := range vals {
+			dst.Add(k, v)
+		}
+	}
+}
+
+func copySafeResponseHeaders(w gin.ResponseWriter, src http.Header) {
+	// Clean existing headers first (avoid mixing)
+	h := w.Header()
+	for k := range h {
+		h.Del(k)
+	}
+
+	for k, vals := range src {
+		// Skip hop-by-hop
+		if _, ok := hopByHop[k]; ok {
+			continue
+		}
+		// Skip drop list
+		if _, ok := dropHeaders[k]; ok {
+			continue
+		}
+
+		for _, v := range vals {
+			w.Header().Add(k, v)
 		}
 	}
 
-	if proxyURL.Scheme == "socks5" {
-		return proxy.SOCKS5("tcp", proxyURL.Host, auth, proxy.Direct)
+	// Do NOT forward Set-Cookie (avoid session coupling / tracking)
+	w.Header().Del("Set-Cookie")
+}
+
+// ====================== Path parsing ======================
+
+// Accept:
+// /https://example.com/path
+// /http://example.com/path
+// /<proxySpec>/https://example.com/path
+// /<proxySpec>/http://example.com/path
+func parseIncomingPath(fullPath string) (requestedURL string, proxySpec string, err error) {
+	p := strings.TrimPrefix(fullPath, "/")
+	if p == "" {
+		return "", "", errors.New("empty path")
 	}
 
-	return &httpProxyDialer{
-		proxyURL: proxyURL,
-		auth:     auth,
-	}, nil
+	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+		return p, "", nil
+	}
+
+	i := strings.Index(p, "/http://")
+	j := strings.Index(p, "/https://")
+
+	idx := -1
+	if i >= 0 && j >= 0 {
+		idx = min(i, j)
+	} else if i >= 0 {
+		idx = i
+	} else if j >= 0 {
+		idx = j
+	}
+
+	if idx <= 0 {
+		return "", "", errors.New("invalid proxy path; expected /proxy/<spec>/http(s)://...")
+	}
+
+	proxySpec = p[:idx]
+	requestedURL = p[idx+1:]
+	return requestedURL, proxySpec, nil
 }
 
-type httpProxyDialer struct {
-	proxyURL *url.URL
-	auth     *proxy.Auth
-}
-
-func (d *httpProxyDialer) Dial(network, addr string) (net.Conn, error) {
-	// Connect to proxy
-	conn, err := net.DialTimeout("tcp", d.proxyURL.Host, 30*time.Second)
+func parseProxySpec(proxySpec string) (*url.URL, error) {
+	ps := strings.TrimSpace(proxySpec)
+	if ps == "" {
+		return nil, nil
+	}
+	if !strings.Contains(ps, "://") {
+		ps = "http://" + ps
+	}
+	pu, err := url.Parse(ps)
 	if err != nil {
 		return nil, err
 	}
-	return conn, nil
+	switch pu.Scheme {
+	case "http", "https", "socks5":
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", pu.Scheme)
+	}
+	if pu.Host == "" {
+		return nil, errors.New("proxy host empty")
+	}
+	return pu, nil
 }
 
-func handleRequest(ctx *gin.Context) {
-	path := ctx.Param("path")
+func createSOCKS5Dialer(pu *url.URL) (proxy.Dialer, error) {
+	var auth *proxy.Auth
+	if pu.User != nil {
+		pw, _ := pu.User.Password()
+		auth = &proxy.Auth{User: pu.User.Username(), Password: pw}
+	}
+	return proxy.SOCKS5("tcp", pu.Host, auth, proxy.Direct)
+}
 
-	if path == "/" {
-		ctx.IndentedJSON(http.StatusOK, gin.H{
-			"message": "🔒 Ultra-Stealth Anonymous Proxy with Advanced Anti-Detection",
-			"usage": "Go to /:url to use, or /proxy-spec/:url to use with proxy",
-			"proxy_formats": []string{
-				"host:port",
-				"username:password@host:port",
-				"host:port@username:password",
-				"host:username:password:port",
-				"username:password:host:port",
-				"socks5://host:port",
-				"socks5://username:password@host:port",
+func newHTTPClient(proxySpec string) (*http.Client, error) {
+	pu, err := parseProxySpec(proxySpec)
+	if err != nil {
+		return nil, err
+	}
+
+	baseTransport := &http.Transport{
+		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		DisableCompression: false,
+	}
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+
+	if pu == nil {
+		baseTransport.DialContext = dialer.DialContext
+		return &http.Client{
+			Transport: baseTransport,
+			Timeout:   60 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				// Sanitize on redirect too
+				req.Header.Del("Referer")
+				req.Header.Del("Origin")
+				req.Header.Del("Cookie")
+				req.Header.Del("Authorization")
+				req.Header.Del("Forwarded")
+				req.Header.Del("X-Forwarded-For")
+				req.Header.Del("X-Real-IP")
+				req.Header.Del("Via")
+				for k := range hopByHop {
+					req.Header.Del(k)
+				}
+				if len(via) >= 10 {
+					return http.ErrUseLastResponse
+				}
+				return nil
+			},
+		}, nil
+	}
+
+	switch pu.Scheme {
+	case "socks5":
+		// SOCKS5: do NOT set Transport.Proxy
+		sd, err := createSOCKS5Dialer(pu)
+		if err != nil {
+			return nil, err
+		}
+		baseTransport.Proxy = nil
+		baseTransport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// socks5 Dialer doesn't take ctx; best-effort
+			type result struct {
+				c   net.Conn
+				err error
+			}
+			ch := make(chan result, 1)
+			go func() {
+				c, e := sd.Dial(network, addr)
+				ch <- result{c: c, err: e}
+			}()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case r := <-ch:
+				return r.c, r.err
+			}
+		}
+
+	case "http", "https":
+		baseTransport.Proxy = http.ProxyURL(pu)
+		baseTransport.DialContext = dialer.DialContext
+
+	default:
+		return nil, fmt.Errorf("unsupported proxy scheme: %s", pu.Scheme)
+	}
+
+	return &http.Client{
+		Transport: baseTransport,
+		Timeout:   60 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// Sanitize on redirect too
+			req.Header.Del("Referer")
+			req.Header.Del("Origin")
+			req.Header.Del("Cookie")
+			req.Header.Del("Authorization")
+			req.Header.Del("Forwarded")
+			req.Header.Del("X-Forwarded-For")
+			req.Header.Del("X-Real-IP")
+			req.Header.Del("Via")
+			for k := range hopByHop {
+				req.Header.Del(k)
+			}
+			if len(via) >= 10 {
+				return http.ErrUseLastResponse
+			}
+			return nil
+		},
+	}, nil
+}
+
+func handleRequest(c *gin.Context) {
+	if c.Param("path") == "/" {
+		c.IndentedJSON(http.StatusOK, gin.H{
+			"message": "Safe forward proxy (passthrough body + keep Content-Encoding)",
+			"usage": []string{
+				"/https://example.com/path",
+				"/http://example.com/path",
+				"/proxy/<proxySpec>/https://example.com/path",
 			},
 		})
-		ctx.Done()
 		return
 	}
 
-	var requestedURL string
-	var proxySpec string
-
-	// Check if this is a proxied URL with proxy spec (format: /proxy:port/http... or /proxy:port/https...)
-	// Find the first occurrence of /http or /https
-	httpIndex := strings.Index(path, "/http")
-	if httpIndex == -1 {
-		httpsIndex := strings.Index(path, "/https")
-		if httpsIndex != -1 {
-			httpIndex = httpsIndex
-		}
-	}
-
-	if httpIndex > 0 {
-		// Found proxy spec before the URL
-		proxySpec = path[1:httpIndex] // Remove leading slash
-		requestedURL = path[httpIndex+1:] // Remove leading slash from URL part
-	} else {
-		// Check if this is a direct proxied URL (starts with /http or /https)
-		if strings.HasPrefix(path, "/http") || strings.HasPrefix(path, "/https") {
-			requestedURL = path[1:]
-		} else {
-			// This might be a relative URL from a previously proxied page
-			// Try to get the original host from Referer header
-			referer := ctx.Request.Header.Get("Referer")
-			if referer != "" {
-				// Extract the proxied URL from referer
-				// Referer will be like: http://localhost:5000/https://example.com/page
-				// or with proxy: http://localhost:5000/proxy:port/https://example.com/page
-				if strings.Contains(referer, "://"+ctx.Request.Host+"/") {
-					parts := strings.SplitN(referer, "/"+ctx.Request.Host+"/", 2)
-					if len(parts) == 2 {
-						refererPath := parts[1]
-						var baseURL string
-
-						// Check if referer path contains proxy spec
-						httpIndex := strings.Index(refererPath, "/http")
-						if httpIndex == -1 {
-							httpsIndex := strings.Index(refererPath, "/https")
-							if httpsIndex != -1 {
-								httpIndex = httpsIndex
-							}
-						}
-
-						if httpIndex > 0 {
-							// Referer has proxy spec, use it for this request too
-							proxySpec = refererPath[:httpIndex]
-							baseURL = refererPath[httpIndex+1:] // Remove leading slash
-						} else {
-							// Referer has direct URL
-							baseURL = refererPath
-						}
-
-						if strings.HasPrefix(baseURL, "http") {
-							// Resolve relative path against the base URL
-							parsedBase, err := url.Parse(baseURL)
-							if err == nil {
-								if strings.HasPrefix(path, "/") {
-									// Absolute path on the same host
-									requestedURL = parsedBase.Scheme + "://" + parsedBase.Host + path
-								} else {
-									// Relative path - resolve against current path
-									basePath := parsedBase.Path
-									if !strings.HasSuffix(basePath, "/") {
-										lastSlash := strings.LastIndex(basePath, "/")
-										if lastSlash >= 0 {
-											basePath = basePath[:lastSlash+1]
-										}
-									}
-									requestedURL = parsedBase.Scheme + "://" + parsedBase.Host + basePath + path
-								}
-							}
-						}
-					}
-				}
-			}
-
-			if requestedURL == "" {
-				ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-					"message": "Invalid URL or missing referer for relative path",
-				})
-				ctx.Done()
-				return
-			}
-
-			// Validate resolved URL
-			parsedURL, err := url.Parse(requestedURL)
-			if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-				ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-					"message": "Invalid resolved URL",
-				})
-				ctx.Done()
-				return
-			}
-		}
+	requestedURL, proxySpec, err := parseIncomingPath(c.Param("path"))
+	if err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
+		return
 	}
 
 	parsedURL, err := url.Parse(requestedURL)
 	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
-		ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-			"message": "Invalid URL",
-		})
-		ctx.Done()
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid URL"})
 		return
 	}
 
-	req, _ := http.NewRequest(ctx.Request.Method, requestedURL, ctx.Request.Body)
-
-	req.Header = ctx.Request.Header.Clone()
-	req.Header.Del("origin")
-	req.Header.Del("referer")
-
-	queryValues := req.URL.Query()
-	for k, v := range ctx.Request.URL.Query() {
-		queryValues.Add(k, v[0])
-	}
-	req.URL.RawQuery = queryValues.Encode()
-
-	var client *http.Client
-	if proxySpec != "" {
-		var proxyURLStr string
-
-		// Support multiple proxy formats:
-		// 1. host:port (simple proxy)
-		// 2. username:password@host:port (standard)
-		// 3. host:port@username:password
-		// 4. host:username:password:port
-		// 5. username:password:host:port
-		// 6. socks5://username:password@host:port (SOCKS5 with auth)
-		// 7. socks5://host:port (SOCKS5 without auth)
-
-		// Check if it's explicitly a SOCKS5 proxy
-		if strings.HasPrefix(proxySpec, "socks5://") {
-			proxyURLStr = proxySpec
-		} else if strings.Contains(proxySpec, "@") {
-			// Could be username:password@host:port or host:port@username:password
-			atIndex := strings.Index(proxySpec, "@")
-			beforeAt := proxySpec[:atIndex]
-			afterAt := proxySpec[atIndex+1:]
-
-			beforeParts := strings.Split(beforeAt, ":")
-			afterParts := strings.Split(afterAt, ":")
-
-			if len(beforeParts) == 2 && len(afterParts) == 2 {
-				// Could be either format, check which one makes sense
-				// If beforeAt looks like host:port and afterAt looks like username:password
-				if (strings.Contains(beforeParts[0], ".") || strings.Contains(beforeParts[0], "-") || net.ParseIP(beforeParts[0]) != nil) {
-					// Format: host:port@username:password
-					host, port := beforeParts[0], beforeParts[1]
-					username, password := afterParts[0], afterParts[1]
-					proxyURLStr = fmt.Sprintf("http://%s:%s@%s:%s", username, password, host, port)
-				} else {
-					// Format: username:password@host:port
-					username, password := beforeParts[0], beforeParts[1]
-					host, port := afterParts[0], afterParts[1]
-					proxyURLStr = fmt.Sprintf("http://%s:%s@%s:%s", username, password, host, port)
-				}
-			} else {
-				// Fallback to standard format
-				proxyURLStr = "http://" + proxySpec
-			}
-		} else {
-			parts := strings.Split(proxySpec, ":")
-			if len(parts) == 2 {
-				// Format: host:port
-				host, port := parts[0], parts[1]
-				proxyURLStr = fmt.Sprintf("http://%s:%s", host, port)
-			} else if len(parts) == 4 {
-				// Could be host:username:password:port or username:password:host:port
-				// Try to detect by checking if first part looks like IP/hostname
-				firstPart := parts[0]
-				if strings.Contains(firstPart, ".") || strings.Contains(firstPart, "-") || net.ParseIP(firstPart) != nil {
-					// Looks like host:username:password:port
-					host, username, password, port := parts[0], parts[1], parts[2], parts[3]
-					proxyURLStr = fmt.Sprintf("http://%s:%s@%s:%s", username, password, host, port)
-				} else {
-					// Looks like username:password:host:port
-					username, password, host, port := parts[0], parts[1], parts[2], parts[3]
-					proxyURLStr = fmt.Sprintf("http://%s:%s@%s:%s", username, password, host, port)
-				}
-			} else {
-				ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-					"message": "Invalid proxy specification. Supported formats: host:port, username:password@host:port, host:port@username:password, host:username:password:port, username:password:host:port, socks5://host:port, or socks5://username:password@host:port",
-				})
-				ctx.Done()
-				return
-			}
-		}
-
-		proxyURL, err := url.Parse(proxyURLStr)
-		if err != nil {
-			ctx.IndentedJSON(http.StatusBadRequest, gin.H{
-				"message": "Invalid proxy specification",
-			})
-			ctx.Done()
-			return
-		}
-
-		// Create transport with DNS resolution through proxy
-		transport := &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-			// Use default TLS config
-			TLSClientConfig: nil,
-			// Force DNS through proxy by using custom dialer
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				// For SOCKS5, use the proxy dialer which handles DNS
-				if proxyURL.Scheme == "socks5" {
-					dialer, err := createProxyDialer(proxyURL)
-					if err != nil {
-						return nil, err
-					}
-					return dialer.Dial(network, addr)
-				}
-				// For HTTP proxy, use standard dialer (HTTP proxy handles DNS)
-				dialer := &net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}
-				return dialer.DialContext(ctx, network, addr)
-			},
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-
-		client = &http.Client{
-			Transport: transport,
-			Timeout:   60 * time.Second,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				// Allow up to 10 redirects
-				if len(via) >= 10 {
-					return http.ErrUseLastResponse
-				}
-				// Simple proxy - no header modifications for redirects
-				return nil
-			},
-		}
-	} else {
-		// Default client without proxy
-		transport := &http.Transport{
-			TLSClientConfig: nil, // Use default TLS config
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		}
-
-		client = &http.Client{
-			Transport: transport,
-			Timeout:   60 * time.Second,
-		}
-	}
-
-	response, err1 := client.Do(req)
-
-	if err1 != nil {
-		ctx.IndentedJSON(http.StatusInternalServerError, gin.H{
-			"message": "Failed to request: " + err1.Error(),
-		})
-		ctx.Done()
+	if err := blockSSRF(parsedURL); err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
 	}
 
-	for k, v := range response.Header {
-		ctx.Header(k, v[0])
-	}
-
-	responseBytes, err2 := io.ReadAll(response.Body)
-
-	if err2 != nil {
-		ctx.IndentedJSON(http.StatusInternalServerError, gin.H{
-			"message": "Failed to read response: " + err2.Error(),
-		})
-		ctx.Done()
+	outReq, err := http.NewRequestWithContext(
+		c.Request.Context(),
+		c.Request.Method,
+		parsedURL.String(),
+		c.Request.Body,
+	)
+	if err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Failed to create request"})
 		return
 	}
 
-	response.Body.Close()
+	outReq.Header = make(http.Header)
+	copySafeRequestHeaders(outReq.Header, c.Request.Header)
 
-	ctx.Data(response.StatusCode, response.Header.Get("Content-Type"), responseBytes)
+	q := outReq.URL.Query()
+	for k, vs := range c.Request.URL.Query() {
+		for _, v := range vs {
+			q.Add(k, v)
+		}
+	}
+	outReq.URL.RawQuery = q.Encode()
+
+	client, err := newHTTPClient(proxySpec)
+	if err != nil {
+		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid proxy: " + err.Error()})
+		return
+	}
+
+	resp, err := client.Do(outReq)
+	if err != nil {
+		c.IndentedJSON(http.StatusBadGateway, gin.H{"message": "Upstream request failed: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	copySafeResponseHeaders(c.Writer, resp.Header)
+	c.Status(resp.StatusCode)
+	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
 func main() {
-	router := gin.Default()
+	addr := ":5000"
+	if v := strings.TrimSpace(os.Getenv("BIND_ADDR")); v != "" {
+		addr = v
+	}
 
-	router.GET("*path", handleRequest)
-	router.POST("*path", handleRequest)
-	router.PUT("*path", handleRequest)
-	router.PATCH("*path", handleRequest)
-	router.DELETE("*path", handleRequest)
-	router.OPTIONS("*path", handleRequest)
-	router.HEAD("*path", handleRequest)
+	r := gin.New()
+	r.Use(gin.Recovery())
 
-	router.Run(":5000")
+	r.GET("/*path", handleRequest)
+	r.POST("/*path", handleRequest)
+	r.PUT("/*path", handleRequest)
+	r.PATCH("/*path", handleRequest)
+	r.DELETE("/*path", handleRequest)
+	r.OPTIONS("/*path", handleRequest)
+	r.HEAD("/*path", handleRequest)
+
+	_ = r.Run(addr)
 }

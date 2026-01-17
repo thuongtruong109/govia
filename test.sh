@@ -3,18 +3,16 @@ echo "Anti-Detection Features Test"
 echo "==================================="
 echo ""
 
-# Colors for output
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
 PROXY_URL="${1:-http://localhost:5000}"
 
 echo "Testing proxy at: $PROXY_URL"
 echo ""
 
-# Test 1: Check if service is running
 echo "Test 1: Service Health Check"
 echo "-----------------------------------"
 response=$(curl -s "$PROXY_URL/")
@@ -125,7 +123,6 @@ for format in "${formats[@]}"; do
 done
 echo ""
 
-# Summary
 echo "==================================="
 echo "Test Summary"
 echo "==================================="
