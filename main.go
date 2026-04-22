@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -30,20 +31,13 @@ var (
 		"Proxy-Authorization": {},
 	}
 
-	dropHeaders = map[string]struct{}{
-		"Forwarded":       {},
-		"X-Forwarded-For": {},
-		"X-Real-Ip":       {},
-		"Via":             {},
-		"X-Proxy-Id":      {},
-		"True-Client-Ip":  {},
-		"Cf-Connecting-Ip": {},
-		"Cookie":        {},
-		"Authorization": {},
-		"Referer":       {},
-		"Origin":        {},
-	}
+	refererMap sync.Map // map[string]*RouteContext
 )
+
+type RouteContext struct {
+	DestURL   string
+	ProxySpec string
+}
 
 // ====================== SSRF protection ======================
 
@@ -127,10 +121,6 @@ func copySafeRequestHeaders(dst, src http.Header) {
 		if _, ok := hopByHop[k]; ok {
 			continue
 		}
-		// Skip drop list headers
-		if _, ok := dropHeaders[k]; ok {
-			continue
-		}
 
 		for _, v := range vals {
 			dst.Add(k, v)
@@ -150,18 +140,11 @@ func copySafeResponseHeaders(w gin.ResponseWriter, src http.Header) {
 		if _, ok := hopByHop[k]; ok {
 			continue
 		}
-		// Skip drop list
-		if _, ok := dropHeaders[k]; ok {
-			continue
-		}
 
 		for _, v := range vals {
 			w.Header().Add(k, v)
 		}
 	}
-
-	// Do NOT forward Set-Cookie (avoid session coupling / tracking)
-	w.Header().Del("Set-Cookie")
 }
 
 // ====================== Path parsing ======================
@@ -247,7 +230,7 @@ func newHTTPClient(proxySpec string) (*http.Client, error) {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		DisableCompression: false,
+		DisableCompression:    true,
 	}
 
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
@@ -258,22 +241,7 @@ func newHTTPClient(proxySpec string) (*http.Client, error) {
 			Transport: baseTransport,
 			Timeout:   60 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				// Sanitize on redirect too
-				req.Header.Del("Referer")
-				req.Header.Del("Origin")
-				req.Header.Del("Cookie")
-				req.Header.Del("Authorization")
-				req.Header.Del("Forwarded")
-				req.Header.Del("X-Forwarded-For")
-				req.Header.Del("X-Real-IP")
-				req.Header.Del("Via")
-				for k := range hopByHop {
-					req.Header.Del(k)
-				}
-				if len(via) >= 10 {
-					return http.ErrUseLastResponse
-				}
-				return nil
+				return http.ErrUseLastResponse
 			},
 		}, nil
 	}
@@ -317,22 +285,7 @@ func newHTTPClient(proxySpec string) (*http.Client, error) {
 		Transport: baseTransport,
 		Timeout:   60 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			// Sanitize on redirect too
-			req.Header.Del("Referer")
-			req.Header.Del("Origin")
-			req.Header.Del("Cookie")
-			req.Header.Del("Authorization")
-			req.Header.Del("Forwarded")
-			req.Header.Del("X-Forwarded-For")
-			req.Header.Del("X-Real-IP")
-			req.Header.Del("Via")
-			for k := range hopByHop {
-				req.Header.Del(k)
-			}
-			if len(via) >= 10 {
-				return http.ErrUseLastResponse
-			}
-			return nil
+			return http.ErrUseLastResponse
 		},
 	}, nil
 }
@@ -351,6 +304,26 @@ func handleRequest(c *gin.Context) {
 	}
 
 	requestedURL, proxySpec, err := parseIncomingPath(c.Param("path"))
+	clientIP := c.ClientIP()
+
+	if err != nil {
+		// Try Referer fallback for implicit asset paths
+		referer := c.Request.Header.Get("Referer")
+		if referer != "" {
+			if refURL, pErr := url.Parse(referer); pErr == nil {
+				if rcIntf, ok := refererMap.Load(clientIP + "|" + refURL.Path); ok {
+					rc := rcIntf.(*RouteContext)
+					baseDestURL, _ := url.Parse(rc.DestURL)
+					resolvedURL := baseDestURL.ResolveReference(c.Request.URL)
+
+					requestedURL = resolvedURL.String()
+					proxySpec = rc.ProxySpec
+					err = nil
+				}
+			}
+		}
+	}
+
 	if err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
 		return
@@ -361,6 +334,12 @@ func handleRequest(c *gin.Context) {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": "Invalid URL"})
 		return
 	}
+
+	// Store successful mapping for subsequent relative asset loads
+	refererMap.Store(clientIP+"|"+c.Request.URL.Path, &RouteContext{
+		DestURL:   parsedURL.String(),
+		ProxySpec: proxySpec,
+	})
 
 	if err := blockSSRF(parsedURL); err != nil {
 		c.IndentedJSON(http.StatusBadRequest, gin.H{"message": err.Error()})
@@ -381,13 +360,20 @@ func handleRequest(c *gin.Context) {
 	outReq.Header = make(http.Header)
 	copySafeRequestHeaders(outReq.Header, c.Request.Header)
 
-	q := outReq.URL.Query()
-	for k, vs := range c.Request.URL.Query() {
-		for _, v := range vs {
-			q.Add(k, v)
+	// Stealth Headers Rewrite
+	if outReq.Header.Get("Referer") != "" {
+		ref := c.Request.Header.Get("Referer")
+		if refURL, pErr := url.Parse(ref); pErr == nil {
+			if rcIntf, ok := refererMap.Load(clientIP + "|" + refURL.Path); ok {
+				outReq.Header.Set("Referer", rcIntf.(*RouteContext).DestURL)
+			}
 		}
 	}
-	outReq.URL.RawQuery = q.Encode()
+	if outReq.Header.Get("Origin") != "" {
+		outReq.Header.Set("Origin", parsedURL.Scheme+"://"+parsedURL.Host)
+	}
+
+	outReq.URL.RawQuery = c.Request.URL.RawQuery
 
 	client, err := newHTTPClient(proxySpec)
 	if err != nil {
